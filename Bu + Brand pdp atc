@@ -1,0 +1,187 @@
+WITH date_range AS (
+  SELECT
+    DATE '2026-11-01' AS start_date,
+    DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY) AS end_date
+),
+
+-- =====================================================
+-- 1. NOVEMBER PDP AND ATC EVENTS
+-- =====================================================
+
+all_events AS (
+  SELECT
+    'PDP' AS event_type,
+    LOWER(product_id) AS event_product_id
+  FROM `slikk-prod.slikksilver.silver_pdp_events`
+  CROSS JOIN date_range d
+  WHERE
+    create_date >= d.start_date
+    AND create_date <= d.end_date
+    AND product_id IS NOT NULL
+
+  UNION ALL
+
+  SELECT
+    'ATC' AS event_type,
+    LOWER(product_id) AS event_product_id
+  FROM `slikk-prod.slikksilver.silver_add_to_cart_events`
+  CROSS JOIN date_range d
+  WHERE
+    create_date >= d.start_date
+    AND create_date <= d.end_date
+    AND product_id IS NOT NULL
+),
+
+-- =====================================================
+-- 2. MAP EVENT PRODUCT IDs TO PRODUCT TABLE IDs
+-- =====================================================
+
+product_mapping AS (
+  SELECT
+    event_product_id,
+    product_id
+  FROM (
+    SELECT
+      e.event_product_id,
+      pp.id AS product_id,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY e.event_product_id
+        ORDER BY
+          CASE
+            WHEN e.event_product_id = LOWER(pp.skid) THEN 1
+            WHEN e.event_product_id = LOWER(pp.sku) THEN 2
+            WHEN e.event_product_id = LOWER(pp.barcode) THEN 3
+          END,
+          pp.id
+      ) AS rn
+
+    FROM (
+      SELECT DISTINCT event_product_id
+      FROM all_events
+    ) e
+
+    JOIN `slikk-prod.slikkprodpublic.product_product` pp
+      ON e.event_product_id = LOWER(pp.skid)
+      OR e.event_product_id = LOWER(pp.sku)
+      OR e.event_product_id = LOWER(pp.barcode)
+  )
+  WHERE rn = 1
+),
+
+-- =====================================================
+-- 3. MAP EVENTS TO PRODUCT IDs
+-- =====================================================
+
+mapped_events AS (
+  SELECT
+    e.event_type,
+    pm.product_id
+
+  FROM all_events e
+
+  JOIN product_mapping pm
+    ON e.event_product_id = pm.event_product_id
+),
+
+-- =====================================================
+-- 4. NOVEMBER PDP AND ATC BY PRODUCT
+-- =====================================================
+
+product_metrics AS (
+  SELECT
+    product_id,
+
+    COUNTIF(event_type = 'PDP') AS pdp_views,
+    COUNTIF(event_type = 'ATC') AS add_to_cart
+
+  FROM mapped_events
+  GROUP BY product_id
+),
+
+-- =====================================================
+-- 5. PRODUCT TAGS
+-- =====================================================
+
+tags AS (
+  SELECT
+    product_id,
+    ANY_VALUE(division) AS division,
+    ANY_VALUE(gender) AS gender
+
+  FROM `slikk-prod.slikkanalytics.silver_new_product_tags`
+  GROUP BY product_id
+),
+
+-- =====================================================
+-- 6. PRODUCT-LEVEL CATEGORY AND BRAND MAPPING
+-- =====================================================
+
+product_base AS (
+  SELECT
+    CASE
+      WHEN UPPER(nt.division) = 'APPAREL'
+        AND LOWER(TRIM(nt.gender)) IN ('men', 'mens', 'unisex', 'unsiex')
+        THEN 'APPAREL MEN'
+
+      WHEN UPPER(nt.division) = 'APPAREL'
+        AND LOWER(TRIM(nt.gender)) IN ('women', 'womens')
+        THEN 'APPAREL WOMEN'
+
+      WHEN UPPER(nt.division) = 'ETHNIC'
+        AND LOWER(TRIM(nt.gender)) IN ('men', 'mens', 'unisex', 'unsiex')
+        THEN 'ETHNIC MEN'
+
+      WHEN UPPER(nt.division) = 'ETHNIC'
+        AND LOWER(TRIM(nt.gender)) IN ('women', 'womens')
+        THEN 'ETHNIC WOMEN'
+
+      WHEN UPPER(nt.division) = 'FOOTWEAR'
+        AND LOWER(TRIM(nt.gender)) IN ('men', 'mens', 'unisex', 'unsiex')
+        THEN 'FW MEN'
+
+      WHEN UPPER(nt.division) = 'FOOTWEAR'
+        AND LOWER(TRIM(nt.gender)) IN ('women', 'womens')
+        THEN 'FW WOMEN'
+
+      ELSE UPPER(nt.division)
+    END AS category,
+
+    COALESCE(pb.name, 'NA') AS brand,
+
+    m.pdp_views,
+    m.add_to_cart
+
+  FROM product_metrics m
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = m.product_id
+
+  LEFT JOIN tags nt
+    ON nt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+)
+
+-- =====================================================
+-- 7. FINAL CATEGORY + BRAND OUTPUT
+-- =====================================================
+
+SELECT
+  category,
+  brand,
+  SUM(pdp_views) AS pdp,
+  SUM(add_to_cart) AS atc
+
+FROM product_base
+
+WHERE category IS NOT NULL
+
+GROUP BY
+  category,
+  brand
+
+ORDER BY
+  category,
+  pdp DESC;
