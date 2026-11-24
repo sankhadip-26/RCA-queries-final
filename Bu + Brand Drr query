@@ -1,0 +1,243 @@
+WITH date_range AS (
+  SELECT
+    DATE_TRUNC(CURRENT_DATE('Asia/Kolkata'), MONTH) AS start_date,
+    DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY) AS end_date
+),
+
+-- =====================================================
+-- 1. SKU IN-STOCK DAYS
+-- =====================================================
+
+sku_in_stock_days AS (
+  SELECT
+    sku,
+    company_code,
+    create_date,
+    store_code,
+    SUM(quantity) AS qty
+
+  FROM `slikk-prod.slikkprodpublic.product_inventorysnapshot`
+  CROSS JOIN date_range d
+
+  WHERE
+    create_date >= d.start_date
+    AND create_date <= d.end_date
+
+  GROUP BY 1, 2, 3, 4
+),
+
+-- =====================================================
+-- 2. SKU SALES
+-- =====================================================
+
+sales AS (
+  SELECT
+    pp.sku AS sku,
+    sc.code AS company_code,
+    DATE(oo.create_date + INTERVAL '330' MINUTE) AS order_date,
+    LOWER(ss.code) AS store_code,
+    SUM(oi.quantity) AS qty_ordered
+
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+
+  JOIN `slikk-prod.slikkprodpublic.store_company` sc
+    ON sc.id = pp.company_id
+
+  JOIN `slikk-prod.slikkprodpublic.store_store` ss
+    ON ss.id = oo.store_id
+
+  CROSS JOIN date_range d
+
+  WHERE
+    oo.delivery_type != 'EXCHANGE'
+    AND oo.status NOT IN ('OPEN', 'FAILED')
+
+    AND DATE(oo.create_date + INTERVAL '330' MINUTE)
+      >= d.start_date
+
+    AND DATE(oo.create_date + INTERVAL '330' MINUTE)
+      <= d.end_date
+
+  GROUP BY 1, 2, 3, 4
+),
+
+-- =====================================================
+-- 3. COMBINE SALES AND INVENTORY
+-- =====================================================
+
+sku_store_days AS (
+  SELECT
+    COALESCE(s.sku, i.sku) AS sku,
+    COALESCE(s.company_code, i.company_code) AS company_code,
+    COALESCE(s.order_date, i.create_date) AS day,
+
+    COALESCE(i.qty, 0) AS inv_qty,
+    COALESCE(s.qty_ordered, 0) AS sold_qty,
+
+    COALESCE(s.store_code, i.store_code) AS store_code
+
+  FROM sales s
+
+  FULL OUTER JOIN sku_in_stock_days i
+    ON s.sku = i.sku
+    AND LOWER(s.company_code) = LOWER(i.company_code)
+    AND s.order_date = i.create_date
+    AND s.store_code = i.store_code
+),
+
+-- =====================================================
+-- 4. ACTIVE DAY FLAG AT STORE LEVEL
+-- =====================================================
+
+store_day_flagged AS (
+  SELECT
+    sku,
+    company_code,
+    store_code,
+    day,
+    inv_qty,
+    sold_qty,
+
+    CASE
+      WHEN inv_qty > 0 OR sold_qty > 0 THEN 1
+      ELSE 0
+    END AS active_day_flag
+
+  FROM sku_store_days
+),
+
+-- =====================================================
+-- 5. CONSOLIDATE TO SKU + COMPANY + DAY
+-- =====================================================
+
+sku_day AS (
+  SELECT
+    sku,
+    company_code,
+    day,
+
+    SUM(sold_qty) AS sold_qty,
+    MAX(active_day_flag) AS active_day_flag
+
+  FROM store_day_flagged
+
+  GROUP BY 1, 2, 3
+),
+
+-- =====================================================
+-- 6. SKU-LEVEL NOVEMBER IN-STOCK DRR
+-- =====================================================
+
+sku_drr AS (
+  SELECT
+    sku,
+    company_code,
+
+    SUM(sold_qty) AS qty_mtd,
+    SUM(active_day_flag) AS active_days_mtd,
+
+    ROUND(
+      SAFE_DIVIDE(
+        SUM(sold_qty),
+        SUM(active_day_flag)
+      )
+      * IF(SUM(active_day_flag) <= 3, 0.5, 1),
+      2
+    ) AS in_stock_drr_mtd
+
+  FROM sku_day
+
+  GROUP BY 1, 2
+),
+
+-- =====================================================
+-- 7. PRODUCT CATEGORY AND BRAND MAPPING
+-- =====================================================
+
+product_dimension AS (
+  SELECT
+    pp.sku,
+    sc.code AS company_code,
+
+    CASE
+      WHEN UPPER(nt.division) = 'APPAREL'
+        AND LOWER(TRIM(nt.gender)) IN ('men', 'mens', 'unisex', 'unsiex')
+        THEN 'APPAREL MEN'
+
+      WHEN UPPER(nt.division) = 'APPAREL'
+        AND LOWER(TRIM(nt.gender)) IN ('women', 'womens')
+        THEN 'APPAREL WOMEN'
+
+      WHEN UPPER(nt.division) = 'ETHNIC'
+        AND LOWER(TRIM(nt.gender)) IN ('men', 'mens', 'unisex', 'unsiex')
+        THEN 'ETHNIC MEN'
+
+      WHEN UPPER(nt.division) = 'ETHNIC'
+        AND LOWER(TRIM(nt.gender)) IN ('women', 'womens')
+        THEN 'ETHNIC WOMEN'
+
+      WHEN UPPER(nt.division) = 'FOOTWEAR'
+        AND LOWER(TRIM(nt.gender)) IN ('men', 'mens', 'unisex', 'unsiex')
+        THEN 'FW MEN'
+
+      WHEN UPPER(nt.division) = 'FOOTWEAR'
+        AND LOWER(TRIM(nt.gender)) IN ('women', 'womens')
+        THEN 'FW WOMEN'
+
+      ELSE UPPER(nt.division)
+    END AS category,
+
+    COALESCE(pb.name, 'NA') AS brand
+
+  FROM `slikk-prod.slikkprodpublic.product_product` pp
+
+  JOIN `slikk-prod.slikkprodpublic.store_company` sc
+    ON sc.id = pp.company_id
+
+  LEFT JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY pp.sku, sc.code
+    ORDER BY pp.id
+  ) = 1
+)
+
+-- =====================================================
+-- 8. FINAL CATEGORY + BRAND AGGREGATION
+-- =====================================================
+
+SELECT
+  pd.category,
+  pd.brand,
+
+  ROUND(
+    SUM(sd.in_stock_drr_mtd),
+    2
+  ) AS in_stock_drr_mtd
+
+FROM sku_drr sd
+
+JOIN product_dimension pd
+  ON sd.sku = pd.sku
+  AND LOWER(sd.company_code) = LOWER(pd.company_code)
+
+WHERE
+  pd.category IS NOT NULL
+
+GROUP BY
+  pd.category,
+  pd.brand
+
+ORDER BY
+  pd.category,
+  in_stock_drr_mtd DESC;
